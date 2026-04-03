@@ -4,8 +4,9 @@
   "description": "A Discord meta-bot that manages OpenClaw bot instances — ticket lifecycle, thread summaries, memory inspection, and config management.",
   "main": "dist/index.js",
   "scripts": {
+    "help": "echo \"\nopenclaw-conductor scripts:\\n  build       compile TypeScript\\n  dev         run in dev mode (ts-node, no build)\\n  serve       start in production (nohup, pid-guarded)\\n  stop        stop the server (pid file)\\n  stop --all  kill all instances (with dir check)\\n  logs        tail live logs\\n  lint        run eslint\\n\"",
     "build": "tsc",
-    "run": "NODE_ENV=development ts-node src/index.ts",
+    "dev": "NODE_ENV=development ts-node src/index.ts",
     "start": "NODE_ENV=production node dist/index.js",
     "serve": "if [ -f logs/conductor.pid ] && kill -0 $(cat logs/conductor.pid) 2>/dev/null; then echo \"Already running (PID $(cat logs/conductor.pid)). Run npm run stop first.\"; exit 1; fi && NODE_ENV=production nohup node dist/index.js >> logs/conductor.log 2>&1 & echo $! > logs/conductor.pid && echo \"Started PID $(cat logs/conductor.pid), logs at logs/conductor.log\"",
     "stop": "f() { if [ \"$1\" = \"--all\" ]; then grep -q '\"name\": \"openclaw-conductor\"' package.json 2>/dev/null || { echo 'ERROR: not in openclaw-conductor directory'; exit 1; }; pkill -f 'node dist/index.js' 2>/dev/null; rm -f logs/conductor.pid && echo 'All instances stopped'; else [ -f logs/conductor.pid ] && kill $(cat logs/conductor.pid) 2>/dev/null && rm -f logs/conductor.pid && echo 'Stopped' || { rm -f logs/conductor.pid; echo 'Not running'; }; fi; }; f",
