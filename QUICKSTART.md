@@ -1,5 +1,11 @@
 # Quick Start
 
+This guide gets you to **step one**: the conductor bot is online and you can talk to it via Discord DM. That's the foundation everything else builds on.
+
+Orchestrating OpenClaw agents and other Discord bots comes next — the conductor walks you through that interactively once it's running (use `/setup` in your server).
+
+---
+
 ## Prerequisites
 
 - Node.js 20+
