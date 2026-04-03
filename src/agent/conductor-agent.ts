@@ -4,7 +4,7 @@ import { Agent } from '@mariozechner/pi-agent-core';
 import type { Guild } from 'discord.js';
 import { logger } from '../logger';
 import { buildTools } from './tools';
-import { loadContext, appendContext } from './context-store';
+import { appendContext, parseContextMessages } from './context-store';
 import { loadMemorySummary } from './long-term-memory';
 import { loadModelChain, type ResolvedModel } from './provider-config';
 
@@ -152,34 +152,24 @@ function loadMemoryBlock(): string {
 }
 
 /**
- * Build onPayload hook that splits system prompt into cache breakpoints:
+ * Build onPayload hook that splits system prompt into two cache breakpoints:
  *   block 1 → AGENT.md       (cache_control: ephemeral) — BP 1, never changes
  *   block 2 → SUMMARY.md     (cache_control: ephemeral) — BP 2, grows slowly
- *   block 3 → Prior context  (no cache_control)          — changes every turn
  *
+ * Prior conversation is passed as initialState.messages, not a system block.
  * For non-Anthropic providers the payload has no system array — returned unchanged.
  */
 function buildOnPayload(
   memorySummary: string,
-  priorContext: string,
 ): ((payload: unknown, model: any) => unknown) | undefined {
-  if (!memorySummary && !priorContext) return undefined;
+  if (!memorySummary) return undefined;
   return (payload: any) => {
     if (!payload || typeof payload !== 'object') return payload;
     if (!Array.isArray(payload.system)) return payload;
     const cacheControl = { type: 'ephemeral' };
-    // Block 1: AGENT.md — already built by pi-ai, mark as BP1
     const block1 = payload.system.map((b: any) => ({ ...b, cache_control: cacheControl }));
-    const extra: any[] = [];
-    // Block 2: Memory summary — BP2
-    if (memorySummary) {
-      extra.push({ type: 'text', text: memorySummary, cache_control: cacheControl });
-    }
-    // Block 3: Prior conversation — no cache (changes every turn)
-    if (priorContext) {
-      extra.push({ type: 'text', text: `## Prior Conversation\n\n${priorContext}` });
-    }
-    return { ...payload, system: [...block1, ...extra] };
+    const block2 = { type: 'text', text: memorySummary, cache_control: cacheControl };
+    return { ...payload, system: [...block1, block2] };
   };
 }
 
@@ -255,7 +245,12 @@ export async function chat(
 ): Promise<string> {
   const systemPrompt = loadAgentSystemPrompt();
   const memorySummary = loadMemoryBlock();
-  const priorContext = loadContext(threadId);
+  const priorMessages = parseContextMessages(threadId);
+  const formattedMessages = priorMessages.map(m =>
+    m.role === 'assistant'
+      ? { ...m, content: [{ type: 'text', text: m.content }] }
+      : m
+  );
   const tools = buildTools(guild, discordCtx);
   const modelChain = getModelChain();
 
@@ -270,9 +265,9 @@ export async function chat(
       logger.info(`Using sticky model "${model.name}" (primary still in cooldown)`);
     }
 
-    const onPayload = buildOnPayload(memorySummary, priorContext);
+    const onPayload = buildOnPayload(memorySummary);
     const agent = new Agent({
-      initialState: { systemPrompt, model, tools },
+      initialState: { systemPrompt, model, tools, messages: formattedMessages as any[] },
       getApiKey: () => model.apiKey,
       ...(onPayload ? { onPayload } : {}),
     });
