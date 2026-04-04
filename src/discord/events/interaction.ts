@@ -14,6 +14,7 @@ import { logger } from '../../logger';
 import { chat, abortIfRunning, steerIfRunning, isAgentRunning, type ToolEvent, type DiscordContext } from '../../agent/conductor-agent';
 import { resolveDmSession, forceNewDmSession, loadContext } from '../../agent/context-store';
 import { writeMemoryBlock, appendMemorySummary } from '../../agent/long-term-memory';
+import { fetchChannelHistory, fetchThreadHistory, NEW_SESSION_MARKER } from '../../agent/channel-history';
 
 // Track the active "thinking" message per thread so we can mark it cancelled
 const activeThinking = new Map<string, Message>();
@@ -52,7 +53,8 @@ async function runChat(
   threadId: string,
   replyChannel: { send: (s: string) => Promise<Message> },
   originalMsg: Message,
-  discordCtx?: DiscordContext
+  discordCtx?: DiscordContext,
+  contextOverride?: string,
 ): Promise<void> {
   // ── If agent is already running: steer or hard-stop ──────────────────────
   if (isAgentRunning(threadId)) {
@@ -102,7 +104,7 @@ async function runChat(
   }
 
   try {
-    const response = await chat(guild, text, threadId, undefined, appendToolLine, discordCtx);
+    const response = await chat(guild, text, threadId, undefined, appendToolLine, discordCtx, contextOverride);
 
     if (statusTimer) { clearTimeout(statusTimer); }
     activeThinking.delete(threadId);
@@ -230,6 +232,68 @@ async function handleDmClean(msg: Message, client: ConductorClient): Promise<voi
   await status.edit(`✅ Done. Deleted ${deleted} of my messages. You can delete yours manually.\n_DM history archived to long-term memory._`);
 }
 
+function getManagementChannelIds(): Set<string> {
+  return new Set(
+    (process.env.CONDUCTOR_CHANNEL_IDS ?? '')
+      .split(',').map(s => s.trim()).filter(Boolean)
+  );
+}
+
+async function handleChannelClean(msg: Message, client: ConductorClient): Promise<void> {
+  const channel = msg.channel as TextChannel | ThreadChannel;
+  const botId = client.user!.id;
+  const guild = msg.guild ?? client.guilds.cache.first() ?? null;
+
+  const status = await channel.send('🧠 Summarizing session to memory...');
+
+  const history = channel.isThread()
+    ? await fetchThreadHistory(channel as ThreadChannel, botId)
+    : await fetchChannelHistory(channel as TextChannel, botId);
+
+  if (history) {
+    try {
+      const summaryPrompt =
+        'Summarize this conversation into a concise memory block. ' +
+        'Extract key facts, decisions, configurations, and anything worth remembering. ' +
+        'Be brief and factual — no greetings or filler. ' +
+        'First line: one-sentence summary (max 120 chars). ' +
+        'Then a Markdown list of key points.\n\n' +
+        history;
+      const summaryText = await chat(null, summaryPrompt, `__clean__ch_${msg.channelId}`, undefined, undefined);
+      if (summaryText && summaryText !== '__aborted__') {
+        const lines = summaryText.trim().split('\n').filter(Boolean);
+        const summaryLine = lines[0].replace(/^#+\s*/, '').replace(/^\*+/, '').trim().slice(0, 120);
+        const filename = writeMemoryBlock(summaryText);
+        appendMemorySummary(`${summaryLine} (→ ${filename})`);
+        logger.info(`Channel session summarized to memory block: ${filename}`);
+      }
+    } catch (err: any) {
+      logger.warn(`Failed to summarize session: ${err.message}`);
+    }
+  }
+
+  await status.edit('🗄️ Memory saved. Clearing my messages...');
+
+  let deleted = 0;
+  let lastId: Snowflake | undefined;
+  while (true) {
+    const batch: Collection<Snowflake, Message> = await channel.messages.fetch({
+      limit: 100,
+      ...(lastId ? { before: lastId } : {}),
+    });
+    if (batch.size === 0) break;
+    const botMessages = batch.filter(m => m.author.id === botId && m.id !== status.id);
+    for (const m of botMessages.values()) {
+      await m.delete().catch(() => {});
+      deleted++;
+    }
+    lastId = batch.last()!.id;
+    if (batch.size < 100) break;
+  }
+
+  await status.edit(`✅ Done. Deleted ${deleted} of my messages.\n_Conversation archived to long-term memory._`);
+}
+
 export function registerInteractionEvent(client: ConductorClient): void {
 
   // ── Slash commands ──────────────────────────────────────────────────────────
@@ -278,10 +342,12 @@ export function registerInteractionEvent(client: ConductorClient): void {
     const isThread = msg.channel.isThread();
     const isDM = msg.channel.type === ChannelType.DM;
 
-    // Communication rule: DM-first, channel-silent after handoff.
-    // Respond only to: DMs, or explicit @mentions.
-    // Never auto-respond to messages in channels/threads without a mention.
-    const shouldRespond = isDM || isMentioned;
+    const mgmtChannelIds = getManagementChannelIds();
+    const parentId = isThread ? (msg.channel as ThreadChannel).parentId ?? '' : '';
+    const isMgmtChannel = mgmtChannelIds.has(msg.channelId) || mgmtChannelIds.has(parentId);
+
+    // Respond to: DMs, explicit @mentions, or messages in a management channel.
+    const shouldRespond = isDM || isMentioned || isMgmtChannel;
     if (!shouldRespond) {
       logger.debug(`Ignored message in #${msg.channelId} from ${msg.author.username}`);
       return;
@@ -356,15 +422,75 @@ export function registerInteractionEvent(client: ConductorClient): void {
       return;
     }
 
+    // ── Management channel path ─────────────────────────────────────────────
+    // Dedicated private channel(s) configured via CONDUCTOR_CHANNEL_IDS.
+    // Behaves like DM: full session, message history from Discord, deletable.
+    if (isMgmtChannel && !isDM) {
+      const mgmtSend = (s: string) => (msg.channel as TextChannel | ThreadChannel).send(s);
+      if (text === '!new') {
+        await mgmtSend(NEW_SESSION_MARKER);
+        return;
+      }
+      if (text === '!clean') {
+        await mgmtSend(
+          `⚠️ This will archive the conversation to long-term memory and delete all my messages.\n` +
+          `Type \`!clean yes\` to confirm.`
+        );
+        return;
+      }
+      if (text === '!clean yes') {
+        await handleChannelClean(msg, client);
+        return;
+      }
+      if (text === '!help') {
+        await mgmtSend(
+          `**Conductor — Channel Commands**\n\n` +
+          `\`!new\` — Start a fresh session (history resets here)\n` +
+          `\`!clean\` — Archive conversation + delete my messages (with confirmation)\n` +
+          `\`stop\` — Interrupt the running task\n\n` +
+          `**Slash Commands**\n` +
+          `\`/model\` — Show or switch the active AI model\n` +
+          `\`/topic\` — Create / manage work topics\n` +
+          `\`/memory\` — Show captured memory\n` +
+          `\`/status\` — List open topics\n` +
+          `\`/openclaw\` — OpenClaw config management\n` +
+          `\`/setup\` — Setup wizard\n`
+        );
+        return;
+      }
+      if (!text) { await mgmtSend('Yes?'); return; }
+
+      const replyChannel = msg.channel as TextChannel | ThreadChannel;
+      const channelName = (replyChannel as any).name ?? msg.channelId;
+      const history = isThread
+        ? await fetchThreadHistory(msg.channel as ThreadChannel, botId!)
+        : await fetchChannelHistory(msg.channel as TextChannel, botId!);
+
+      const threadId = `ch_${msg.channelId}`;
+      logger.info(`Agent chat [mgmt-channel:${threadId}] from ${msg.author.username}: "${text.slice(0, 80)}"`);
+
+      const mgmtCtx: DiscordContext = {
+        guildId: msg.guild?.id ?? '', guildName: msg.guild?.name ?? '',
+        channelId: msg.channelId, channelName, isDM: false,
+      };
+      if (isThread) {
+        const thread = msg.channel as ThreadChannel;
+        mgmtCtx.parentChannelId = thread.parentId ?? undefined;
+        mgmtCtx.parentChannelName = (thread.parent as TextChannel | null)?.name ?? undefined;
+      }
+
+      await runChat(guild, text, threadId, replyChannel, msg, mgmtCtx, history);
+      return;
+    }
+
     // ── Guild path ──────────────────────────────────────────────────────────
-    // Communication rule: conductor is channel-silent after setup.
-    // In any channel or thread, conductor responds ONCE (inline) then goes silent.
-    // No persistent "Chat" threads created in channels — management happens via DM.
+    // Conductor is channel-silent after setup.
+    // In any non-management channel, one inline response per @mention then silent.
     const replyChannel = msg.channel as TextChannel | ThreadChannel;
     const channelName = (replyChannel as any).name ?? msg.channelId;
 
     if (!text) {
-      await replyChannel.send('Yes? (For ongoing management conversations, DM me directly.)');
+      await replyChannel.send('Yes? (For management conversations, use the dedicated channel or DM me.)');
       return;
     }
 

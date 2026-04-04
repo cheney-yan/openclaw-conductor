@@ -221,6 +221,41 @@ export function buildOpenClawTools(): AgentTool<any>[] {
       },
     },
 
+    // ── Write: write any file inside openclaw root ───────────────────────────
+    {
+      name: 'openclaw_write_file',
+      label: 'Write OpenClaw File',
+      description:
+        'Write (create or overwrite) a text file within the OpenClaw root directory (~/.openclaw by default) ' +
+        'or an agent workspace. Use this to edit SOUL.md, hooks, skills, or any other agent config files. ' +
+        'Path must be relative to the openclaw root. Auto-snapshots before writing so changes are undoable. ' +
+        'Examples: "agents/luna/SOUL.md", "agents/luna/hooks/post-message.sh".',
+      parameters: Type.Object({
+        relative_path: Type.String({
+          description: 'Path relative to openclaw root, e.g. "agents/luna/SOUL.md"',
+        }),
+        content: Type.String({
+          description: 'Full UTF-8 text content to write to the file',
+        }),
+      }),
+      execute: async (_id, p: { relative_path: string; content: string }) => {
+        const root = getOpenClawRoot() ?? path.join(process.env.HOME ?? '~', '.openclaw');
+        const resolved = path.resolve(root, p.relative_path);
+        if (!resolved.startsWith(path.resolve(root))) {
+          return ok('Path traversal not allowed.');
+        }
+        try {
+          await snapshotBefore(`file write: ${p.relative_path}`);
+          fs.mkdirSync(path.dirname(resolved), { recursive: true });
+          fs.writeFileSync(resolved, p.content, 'utf-8');
+          logger.info(`Wrote file: ${resolved}`);
+          return ok(`Written: ${p.relative_path} (${p.content.length} chars)`);
+        } catch (err: any) {
+          return ok(`Failed to write ${p.relative_path}: ${err.message}`);
+        }
+      },
+    },
+
     // ── Snapshot: list history ───────────────────────────────────────────────
     {
       name: 'openclaw_snapshot_list',

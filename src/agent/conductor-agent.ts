@@ -156,20 +156,28 @@ function loadMemoryBlock(): string {
  *   block 1 → AGENT.md       (cache_control: ephemeral) — BP 1, never changes
  *   block 2 → SUMMARY.md     (cache_control: ephemeral) — BP 2, grows slowly
  *
- * Prior conversation is passed as initialState.messages, not a system block.
+ * Prior conversation from local context files is passed as initialState.messages.
+ * Channel history (contextOverride) is injected as an additional system block.
  * For non-Anthropic providers the payload has no system array — returned unchanged.
  */
 function buildOnPayload(
   memorySummary: string,
+  contextOverride?: string,
 ): ((payload: unknown, model: any) => unknown) | undefined {
-  if (!memorySummary) return undefined;
+  if (!memorySummary && !contextOverride) return undefined;
   return (payload: any) => {
     if (!payload || typeof payload !== 'object') return payload;
     if (!Array.isArray(payload.system)) return payload;
     const cacheControl = { type: 'ephemeral' };
     const block1 = payload.system.map((b: any) => ({ ...b, cache_control: cacheControl }));
-    const block2 = { type: 'text', text: memorySummary, cache_control: cacheControl };
-    return { ...payload, system: [...block1, block2] };
+    const extra: any[] = [];
+    if (memorySummary) {
+      extra.push({ type: 'text', text: memorySummary, cache_control: cacheControl });
+    }
+    if (contextOverride) {
+      extra.push({ type: 'text', text: `## Channel History\n\n${contextOverride}` });
+    }
+    return { ...payload, system: [...block1, ...extra] };
   };
 }
 
@@ -241,11 +249,14 @@ export async function chat(
   threadId: string,
   onUpdate?: (partial: string) => void,
   onToolEnd?: (evt: ToolEvent) => void,
-  discordCtx?: DiscordContext
+  discordCtx?: DiscordContext,
+  contextOverride?: string,
 ): Promise<string> {
   const systemPrompt = loadAgentSystemPrompt();
   const memorySummary = loadMemoryBlock();
-  const priorMessages = parseContextMessages(threadId);
+  // Channel sessions: contextOverride is plain text history → injected as system block
+  // DM sessions: structured messages from local context file → passed as initialState.messages
+  const priorMessages = contextOverride !== undefined ? [] : parseContextMessages(threadId);
   const formattedMessages = priorMessages.map(m =>
     m.role === 'assistant'
       ? { ...m, content: [{ type: 'text', text: m.content }] }
@@ -265,7 +276,7 @@ export async function chat(
       logger.info(`Using sticky model "${model.name}" (primary still in cooldown)`);
     }
 
-    const onPayload = buildOnPayload(memorySummary);
+    const onPayload = buildOnPayload(memorySummary, contextOverride);
     const agent = new Agent({
       initialState: { systemPrompt, model, tools, messages: formattedMessages as any[] },
       getApiKey: () => model.apiKey,
@@ -347,7 +358,8 @@ export async function chat(
       }
 
       const finalResponse = response || '(no response)';
-      appendContext(threadId, userMessage, finalResponse);
+      // Skip local context file when channel history is the source of truth
+      if (contextOverride === undefined) appendContext(threadId, userMessage, finalResponse);
       logger.info(`Agent responded [thread:${threadId}] via "${model.name}": "${finalResponse.slice(0, 80)}"`);
       return finalResponse;
 
